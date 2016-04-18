@@ -6,6 +6,19 @@
 #include "usart.h"
 #include "comm.h"
 
+#define LED_RED_ON PORTB |= (1<<7)
+#define LED_RED_OFF PORTB &= ~(1<<7)
+#define LED_GREEN_ON PORTB |= (1<<6)
+#define LED_GREEN_OFF PORTB &= ~(1<<6)
+#define INV_A13_HI PORTF |= (1<<6)
+#define INV_A13_LOW PORTF &= ~(1<<6)
+#define MODE_READ { PORTC = 0xFF; DDRC = 0; }
+#define MODE_WRITE { DDRC = 0xFF; }
+#define WRITE_HI PORTF |= (1<<4)
+#define WRITE_LOW PORTF &= ~(1<<4)
+#define READ_HI PORTG |= (1<<3)
+#define READ_LOW PORTG &= ~(1<<3)
+
 ISR(USART0_RX_vect)
 {
 	unsigned char b;
@@ -14,6 +27,11 @@ ISR(USART0_RX_vect)
 		b = UDR0;
 		comm_proceed(b);
 	}
+}
+
+static inline void clock_wait(double clock)
+{
+	_delay_us(clock * 0.55);
 }
 
 static const unsigned char BitReverseTable256[] = 
@@ -35,6 +53,7 @@ static const unsigned char BitReverseTable256[] =
   0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7, 
   0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
 };
+
 
 void set_address(unsigned int address)
 {	
@@ -86,7 +105,6 @@ void write_chr_byte(unsigned int address, uint8_t data)
 	WRITE_LOW;
 	_delay_us(1);
 	WRITE_HI;
-	_delay_us(1);
 	MODE_READ;
 }
 
@@ -103,10 +121,127 @@ void write_chr(unsigned int address, unsigned int len, uint8_t* data)
 	LED_RED_OFF;
 }
 
+static void write_eprom_prepare()
+{
+	set_address(0x2000);
+	READ_HI;
+	WRITE_HI;
+	MODE_WRITE;
+	LED_RED_ON;
+	_delay_ms(1000);
+	LED_RED_OFF;
+}
+
+static void write_eprom_byte(unsigned int address, uint8_t data)
+{
+	set_address(address | (1<<13));
+	int tries = 0;
+	while (tries < 10)
+	{
+		MODE_WRITE;
+		PORTC = data;
+		_delay_us(100);
+		set_address(address);		
+		WRITE_LOW;
+		_delay_us(100);
+		set_address(address | (1<<13));
+		WRITE_HI;
+		_delay_us(100);
+		tries++;
+	}
+}
+
+static void write_eprom(unsigned int address, unsigned int len, uint8_t* data)
+{
+	LED_RED_ON;
+	while (len > 0)
+	{
+		write_eprom_byte(address, *data);
+		len--;
+		address++;
+		data++;
+	}
+	MODE_READ;
+	LED_RED_OFF;
+}
+
+static void write_flash_command(unsigned int address, uint8_t data)
+{
+	set_address(address | (1<<13));
+	WRITE_HI;
+	MODE_WRITE;
+	PORTC = data;
+	_delay_us(1);
+	set_address(address);
+	WRITE_LOW;
+	_delay_us(1);
+	set_address(address | (1<<13));
+	WRITE_HI;
+	_delay_us(1);
+}
+
+static int write_flash_byte(unsigned int address, uint8_t data)
+{
+	write_flash_command(0x0555, 0xAA);
+	write_flash_command(0x02AA, 0x55);
+	write_flash_command(0x0555, 0xA0);
+	write_flash_command(address, data);
+	
+	int timeout = 0;
+	while (read_chr_byte(address) != data && timeout < 10)
+	{
+		_delay_us(100);
+		timeout++;
+	}
+	return timeout < 10;
+}
+
+static int erase_flash()
+{
+	LED_RED_ON;
+	write_flash_command(0x0555, 0xAA);
+	write_flash_command(0x02AA, 0x55);
+	write_flash_command(0x0555, 0x80);
+	write_flash_command(0x0555, 0xAA);
+	write_flash_command(0x02AA, 0x55);
+	write_flash_command(0x0555, 0x10);
+	
+	int timeout = 0;
+	while ((read_chr_byte(0) != 0xFF) && (timeout < 10000))
+	{
+		_delay_ms(1);
+		timeout++;
+	}
+	LED_RED_OFF;
+	return timeout < 10000;
+}
+
+static int write_flash(unsigned int address, unsigned int len, uint8_t* data)
+{
+	LED_RED_ON;
+	if (address >= 0x8000) address -= 0x8000;
+	int ok = 1;
+	while (len > 0)
+	{
+		if (!write_flash_byte(address, *data))
+		{
+			ok = 0;
+			break;
+		}
+		address++;
+		len--;
+		data++;
+	}
+	MODE_READ;
+	LED_RED_OFF;
+	return ok;
+}
+
 uint8_t get_mirroring()
 {
 	LED_GREEN_ON;
 	set_address(1<<10);
+//	READ_HI;
 	_delay_ms(1);
 	char is_vertical = ((PING >> 4) & 1);
 	set_address(1<<11);
@@ -119,8 +254,54 @@ uint8_t get_mirroring()
 	return 0xff;
 }
 
+/*
+static void reset()
+{
+	READ_LOW;
+	WRITE_LOW;
+	MODE_READ;
+	set_address(0);
+	_delay_ms(1000);	
+	READ_HI;
+	WRITE_HI;
+}
+*/
+
 int main (void)
 {
+	// Short circuit test
+/*
+	DDRB |= (1 << 6) | (1 << 7); // LEDS
+	DDRF |= (1<<4); // PPU /WR
+	WRITE_HI;
+	DDRG |= (1<<3); // PPU /RD
+	READ_HI;
+	while(1) 
+	{
+		int i;
+		for (i = 0; i < 8; i++)
+		{
+			DDRC = 0;
+			PORTC = 0xFF;
+			PORTC &= ~(1<<i);
+			DDRC |= 1<<i;
+			LED_RED_OFF;
+			LED_GREEN_OFF;
+			_delay_ms(500);
+			if ((PINC != PORTC))
+			{
+				LED_RED_ON;
+			} else {
+				LED_GREEN_ON;
+			}
+			_delay_ms(500);
+		}
+
+	}
+*/
+
+	_delay_ms(500);
+	
 	USART_init();
 	sei();
 
@@ -144,16 +325,49 @@ int main (void)
 	
 	MODE_READ;
 	
+	
 	comm_init();
 	comm_start(COMMAND_CHR_STARTED, 0);
 	
 	uint16_t address;
 	uint16_t length;
 	
+	unsigned long int t = 0;
+	char led_down = 0;
+	int led_bright = 0;
+	
 	while (1)
 	{
+		TCCR1A |= (1<<COM1C1) | (1<<COM1B1) | (1<<WGM10);
+		TCCR1B |= (1<<CS10);
+		if (t++ >= 10000)
+		{
+			if (!led_down)
+			{
+				led_bright++;
+				if (led_bright >= 110) led_down = 1;
+			} else {
+				led_bright--;
+				if (!led_bright) led_down = 0;
+			}
+			if (led_bright >= 100) OCR1B = led_bright - 100;
+			if (led_down)
+			{
+				int led_bright2 = 110-led_bright;
+				if (led_bright2 <= 20)
+				{
+					if (led_bright2 > 10) led_bright2 = 20 - led_bright2;
+					OCR1C = led_bright2*2;
+				}
+			}
+			t = 0;
+		}
+		
 		if (comm_recv_done)
 		{
+			t = led_down = led_bright = 0;
+			TCCR1A = OCR1B = OCR1C = 0;
+			
 			switch (comm_recv_command)
 			{
 				case COMMAND_CHR_INIT:
@@ -177,6 +391,36 @@ int main (void)
 					comm_start(COMMAND_MIRRORING_RESULT, 1);
 					comm_send_byte(get_mirroring());
 					break;
+
+				case COMMAND_EPROM_PREPARE:
+					write_eprom_prepare();
+					break;
+				
+				case COMMAND_CHR_EPROM_WRITE_REQUEST:
+					address = recv_buffer[0] | ((uint16_t)recv_buffer[1]<<8);
+					length = recv_buffer[2] | ((uint16_t)recv_buffer[3]<<8);
+					write_eprom(address, length, (uint8_t*)&recv_buffer[4]);
+					comm_start(COMMAND_CHR_WRITE_DONE, 0);
+					break;
+					
+				case COMMAND_CHR_FLASH_ERASE_REQUEST:
+					if (erase_flash())
+						comm_start(COMMAND_CHR_WRITE_DONE, 0);
+					break;
+
+				case COMMAND_CHR_FLASH_WRITE_REQUEST:
+					address = recv_buffer[0] | ((uint16_t)recv_buffer[1]<<8);
+					length = recv_buffer[2] | ((uint16_t)recv_buffer[3]<<8);
+					if (write_flash(address, length, (uint8_t*)&recv_buffer[4]))
+						comm_start(COMMAND_CHR_WRITE_DONE, 0);
+					break;
+
+
+				/*
+				case COMMAND_RESET:
+					reset();
+					break;
+				*/
 			}
 			comm_recv_done = 0;
 		}		

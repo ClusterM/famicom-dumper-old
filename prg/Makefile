@@ -2,7 +2,7 @@
 #HFUSE          = DD
 MCU_PROGRAMMER = m64
 PROGRAMMER_TYPE = avr109 
-PROGRAMMER_PORT = com13
+PROGRAMMER_PORT = com17
 
 PRG            = famicom-prg
 OBJ            = prg.o usart.o usart2.o comm.o
